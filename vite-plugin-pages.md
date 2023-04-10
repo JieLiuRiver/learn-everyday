@@ -309,3 +309,336 @@ export function getPageFiles(path: string, options: ResolvedOptions, pageOptions
 `getPageDirs` 函数接受一个 `PageOptions` 对象，以及项目的根目录和要排除的文件列表作为参数，然后使用 `fast-glob` 包中的 `sync` 方法获取所有满足条件的目录，并将每个目录作为一个 `PageOptions` 对象返回。
 
 `getPageFiles` 函数接受一个路径字符串和一个 `ResolvedOptions` 对象作为参数，用于解析指定路径下的页面文件。在此过程中，该函数使用 `fast-glob` 包中的 `sync` 方法获取满足指定条件的所有文件，并返回这些文件的数组。
+
+
+
+## 原理
+
+当执行 `yarn dev` 时，Vite 将启动开发服务器，并在插件的 `configureServer` 方法中设置热重载。具体的执行顺序如下：
+
+1. Vite 启动开发服务器，加载插件。
+2. 插件的 `configResolved` 方法被调用，用于解析插件选项和页面配置，打印调试信息。
+3. 插件的 `configureServer` 方法被调用，用于设置热重载，并将生成路由配置的函数传递给它。
+4. 当页面发生更改时，插件的 `configureServer` 方法会重新生成路由配置，并将其存储在变量中。
+5. 当客户端请求页面时，插件的 `load` 方法会生成客户端代码，并将路由信息作为参数传递给 Vue Router。
+6. 插件的 `generateBundle` 方法在构建后被调用，用于替换输出代码中的方括号。
+
+总之，vite-plugin-pages 通过解析文件命名规则，生成路由配置，并在运行时生成客户端代码来提供基于文件的路由功能。在开发服务器启动后，插件会自动处理热重载，并根据需要重新生成路由配置。
+
+
+
+## generate
+
+```ts
+import { parse } from 'path'
+import { Route, ResolvedOptions, ResolvedPages } from './types'
+import {
+  isDynamicRoute,
+  isCatchAllRoute,
+} from './utils'
+import { stringifyRoutes } from './stringify'
+import { sortPages } from './pages'
+
+function prepareRoutes(
+  routes: Route[],
+  options: ResolvedOptions,
+  parent?: Route,
+) {
+  for (const route of routes) {
+    if (route.name)
+      route.name = route.name.replace(/-index$/, '')
+
+    if (parent)
+      route.path = route.path.replace(/^\//, '')
+
+    if (!options.react)
+      route.props = true
+
+    if (options.react) {
+      delete route.name
+      route.routes = route.children
+      delete route.children
+      route.exact = true
+    }
+
+    if (route.children) {
+      delete route.name
+      route.children = prepareRoutes(route.children, options, route)
+    }
+
+    if (!options.react)
+      Object.assign(route, route.customBlock || {})
+
+    delete route.customBlock
+
+    Object.assign(route, options.extendRoute?.(route, parent) || {})
+  }
+
+  return routes
+}
+
+export function generateRoutes(pages: ResolvedPages, options: ResolvedOptions): Route[] {
+  const {
+    nuxtStyle,
+  } = options
+
+  const routes: Route[] = []
+
+  sortPages(pages).forEach((page) => {
+    const pathNodes = page.route.split('/')
+
+    // add leading slash to component path if not already there
+    const component = page.component.startsWith('/') ? page.component : `/${page.component}`
+
+    const route: Route = {
+      name: '',
+      path: '',
+      component,
+      customBlock: page.customBlock,
+    }
+
+    let parentRoutes = routes
+
+    for (let i = 0; i < pathNodes.length; i++) {
+      const node = pathNodes[i]
+      const isDynamic = isDynamicRoute(node, nuxtStyle)
+      const isCatchAll = isCatchAllRoute(node, nuxtStyle)
+      const normalizedName = isDynamic
+        ? nuxtStyle
+          ? isCatchAll ? 'all' : node.replace(/^_/, '')
+          : node.replace(/^\[(\.{3})?/, '').replace(/\]$/, '')
+        : node
+      const normalizedPath = normalizedName.toLowerCase()
+
+      route.name += route.name ? `-${normalizedName}` : normalizedName
+
+      // Check nested route
+      const parent = parentRoutes.find(node => node.name === route.name)
+
+      if (parent) {
+        parent.children = parent.children || []
+        parentRoutes = parent.children
+        route.path = ''
+      } else if (normalizedName.toLowerCase() === 'index' && !route.path) {
+        route.path += '/'
+      } else if (normalizedName.toLowerCase() !== 'index') {
+        if (isDynamic) {
+          route.path += `/:${normalizedName}`
+          // Catch-all route
+          if (isCatchAll)
+            route.path += '(.*)*'
+        } else {
+          route.path += `/${normalizedPath}`
+        }
+      }
+    }
+
+    parentRoutes.push(route)
+  })
+
+  const preparedRoutes = prepareRoutes(routes, options)
+
+  let finalRoutes = preparedRoutes.sort((a, b) => {
+    if (a.path.includes(':') && b.path.includes(':'))
+      return b.path > a.path ? 1 : -1
+    else if (a.path.includes(':') || b.path.includes(':'))
+      return a.path.includes(':') ? 1 : -1
+    else
+      return b.path > a.path ? 1 : -1
+  })
+
+  // replace duplicated cache all route
+  const allRoute = finalRoutes.find((i) => {
+    return isCatchAllRoute(parse(i.component).name, nuxtStyle)
+  })
+  if (allRoute) {
+    finalRoutes = finalRoutes.filter(i => !isCatchAllRoute(parse(i.component).name, nuxtStyle))
+    finalRoutes.push(allRoute)
+  }
+
+  return finalRoutes
+}
+
+export function generateClientCode(routes: Route[], options: ResolvedOptions) {
+  const { imports, stringRoutes } = stringifyRoutes(routes, options)
+
+  return `${imports.join(';\n')};\n\nconst routes = ${stringRoutes};\n\nexport default routes;`
+}
+```
+
+
+
+这段代码是用于生成路由配置的。它主要包括两个函数：`generateRoutes` 和 `generateClientCode`。这段代码是用于 Vite 插件 Voie 的，用于自动生成 Vue 和 React项目的路由配置。
+
+1. `generateRoutes` 函数接收两个参数：`pages` 和 `options`。`pages` 是一个包含项目中所有页面信息的数组，`options` 是一些配置选项。这个函数的主要目的是根据页面信息生成一个路由配置数组。
+2. `generateClientCode` 函数接收两个参数：`routes` 和 `options`。`routes` 是由 `generateRoutes`生成的路由配置数组，`options` 是一些配置选项。这个函数的主要目的是将路由配置数组转换为可在客户端执行的 JavaScript代码。
+
+让我们通过一个简单的例子来了解这段代码的工作原理。
+
+假设我们有以下项目结构：
+
+```
+src/
+ pages/
+ index.vue
+ about.vue
+ user/
+ _id.vue
+```
+
+`generateRoutes` 函数将接收以下输入：
+
+```javascript
+pages = [
+ { route: 'index', component: '/src/pages/index.vue' },
+ { route: 'about', component: '/src/pages/about.vue' },
+ { route: 'user/_id', component: '/src/pages/user/_id.vue' },
+];
+
+options = {
+ nuxtStyle: true, // 使用 Nuxt.js 风格的动态路由
+};
+```
+
+`generateRoutes` 函数将生成以下路由配置数组：
+
+```javascript
+[
+ {
+   name: 'index',
+   path: '/',
+   component: '/src/pages/index.vue',
+ },
+ {
+   name: 'about',
+   path: '/about',
+   component: '/src/pages/about.vue',
+ },
+ {
+   name: 'user-id',
+   path: '/user/:id',
+   component: '/src/pages/user/_id.vue',
+ },
+];
+```
+
+接下来，`generateClientCode` 函数将接收这个路由配置数组和配置选项，并生成以下客户端代码：
+
+```javascript
+import _default_0 from '/src/pages/index.vue';
+import _default_1 from '/src/pages/about.vue';
+import _default_2 from '/src/pages/user/_id.vue';
+
+const routes = [
+ { name: 'index', path: '/', component: _default_0 },
+ { name: 'about', path: '/about', component: _default_1 },
+ { name: 'user-id', path: '/user/:id', component: _default_2 },
+];
+
+export default routes;
+```
+
+这段客户端代码可以直接在 Vue 或 React项目中使用，以自动配置路由。
+
+
+
+## Webpack
+
+要在 webpack 中实现类似于 vite-plugin-pages 的功能，你可以编写一个自定义的 webpack 插件。这个插件将在编译期间自动生成路由配置。以下是实现这个插件的整体思路：
+
+1. 创建一个新的 webpack 插件类，例如 `WebpackPagesPlugin`。
+
+2. 在插件类的 `apply` 方法中，监听 webpack 的 `compilation` 事件。这个事件在每次编译开始时触发。
+
+3. 当 `compilation` 事件触发时，执行以下操作：
+
+   a. 使用 webpack 提供的 `glob` 或其他文件查找库，查找项目中的所有页面组件。这些组件通常位于一个特定的目录，例如 `src/pages`。
+
+   b. 分析找到的页面组件，提取路由信息。例如，从文件名和目录结构中提取动态路由参数。
+
+   c. 根据提取的路由信息，生成一个路由配置数组。这个数组应该与 React Router v5 的路由配置格式兼容。
+
+   d. 将路由配置数组转换为 JavaScript 代码字符串，并将其添加到一个新的虚拟文件中。这个虚拟文件可以使用 webpack 的 `compilation.assets` API 添加到编译输出中。
+
+4. 在项目的入口文件（例如 `src/index.js`）中，导入并使用生成的虚拟文件。这将自动配置 React Router v5 的路由。
+
+以下是一个简化的 `WebpackPagesPlugin` 示例：
+
+```javascript
+const glob = require('glob');
+const path = require('path');
+
+class WebpackPagesPlugin {
+  constructor(options) {
+    this.options = options || {};
+  }
+
+  apply(compiler) {
+    compiler.hooks.compilation.tap('WebpackPagesPlugin', (compilation) => {
+      // 查找所有页面组件
+      const pages = glob.sync(path.join(this.options.pagesDir, '**/*.jsx'));
+
+      // 生成路由配置数组
+      const routes = generateRoutes(pages, this.options);
+
+      // 转换路由配置数组为 JavaScript 代码字符串
+      const clientCode = generateClientCode(routes, this.options);
+
+      // 将生成的代码添加到虚拟文件中
+      compilation.assets['generated-routes.js'] = {
+        source: () => clientCode,
+        size: () => clientCode.length,
+      };
+    });
+  }
+}
+
+function generateRoutes(pages, options) {
+  // 实现类似于 generateRoutes 的逻辑
+}
+
+function generateClientCode(routes, options) {
+  // 实现类似于 generateClientCode 的逻辑
+}
+```
+
+要使用这个插件，你需要在 webpack 配置中将其添加到 `plugins` 数组中：
+
+```javascript
+const WebpackPagesPlugin = require('./webpack-pages-plugin');
+
+module.exports = {
+  // ...
+  plugins: [
+    // ...
+    new WebpackPagesPlugin({
+      pagesDir: path.join(__dirname, 'src/pages'),
+      // 其他配置选项
+    }),
+  ],
+};
+```
+
+最后，在项目的入口文件中，导入并使用生成的虚拟文件：
+
+```javascript
+import React from 'react';
+import { BrowserRouter as Router, Route, Switch } from 'react-router-dom';
+import routes from './generated-routes';
+
+function App() {
+  return (
+    <Router>
+      <Switch>
+        {routes.map((route, index) => (
+          <Route key={index} path={route.path} component={route.component} />
+        ))}
+      </Switch>
+    </Router>
+  );
+}
+
+export default App;
+```
+
+这样，你就可以在 webpack 中实现类似于 vite-plugin-pages 的功能，自动生成并配置 React Router v5 的路由。
