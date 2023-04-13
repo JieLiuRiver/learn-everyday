@@ -457,3 +457,155 @@ http {
 - 包含了 /etc/nginx/conf.d/*.conf 目录下的所有配置文件。
 
 通过这个 nginx.conf 文件，可以配置 Nginx 反向代理服务器的行为，将请求转发到后端的 Node.js 服务器，并记录访问日志等操作。这个配置文件可以根据实际需求进行调整和扩展。
+
+### log 
+
+`utils/logger.ts`
+```ts
+import { existsSync, mkdirSync } from 'fs'; 
+import { join } from 'path';
+import winston from 'winston';
+import winstonDaily from 'winston-daily-rotate-file';
+import { LOG_DIR } from '@config';
+
+// logs 目录
+const logDir: string = join(__dirname, LOG_DIR);  
+
+if (!existsSync(logDir)) {   
+  mkdirSync(logDir);
+}  
+
+// 定义日志格式
+const logFormat = winston.format.printf(({ timestamp, level, message }) => `${timestamp} ${level}: ${message}`);   
+
+/*  
+ * 日志级别  
+ * error: 0, warn: 1, info: 2, http: 3, verbose: 4, debug: 5, silly: 6  
+ */
+const logger = winston.createLogger({  
+  format: winston.format.combine(    
+    winston.format.timestamp({      
+      format: 'YYYY-MM-DD HH:mm:ss',    
+    }),    
+    logFormat,  
+  ),
+  transports: [   
+   // 调试日志设置   
+    new winstonDaily({     
+      level: 'debug',    
+      datePattern: 'YYYY-MM-DD',     
+      dirname: logDir + '/debug', //日志文件/logs/debug/*.log保存     
+      filename: `%DATE%.log`,    
+      maxFiles: 30, // 30 天保存    
+      json: false,    
+      zippedArchive: true,  
+    }),  
+    // 错误日志设置  
+    new winstonDaily({     
+      level: 'error',     
+      datePattern: 'YYYY-MM-DD',     
+      dirname: logDir + '/error', //日志文件/logs/error/*.log保存     
+      filename: `%DATE%.log`,     
+      maxFiles: 30, // 30 天保存     
+      handleExceptions: true,     
+      json: false,     
+      zippedArchive: true,  
+    }),  
+  ],
+});  
+
+logger.add(  
+  new winston.transports.Console({
+    format: winston.format.combine(winston.format.splat(), winston.format.colorize()),  
+  }),
+);  
+
+const stream = {  
+  write: (message: string) => {    
+    logger.info(message.substring(0, message.lastIndexOf('\n')));  
+  },
+};  
+
+export { logger, stream };
+```
+这个设计的目的是建立一个日志系统,具有如下好处:
+1. 日志分级 - 根据错误级别将日志分配到error和debug日志中,方便查看
+2. 日志切割 - 限制日志文件的大小和数量,避免日志填满存储空间
+3. 记录日志时间 - 文件名称包含日期,易于区分和查找日志
+4. 压缩日志 - 压缩旧日志文件,节省存储空间
+5. 控制台打印 - 同时在控制台打印日志,方便调试
+6. 日志格式 - 简单的日志格式包括时间、级别和消息,易于浏览
+7. 异常捕获 - 记录未捕获的异常和错误
+
+
+### ValidateEnv
+
+`utils/validateEnv.ts`
+```ts
+import { cleanEnv, port, str } from 'envalid';
+
+export const ValidateEnv = () => {
+  cleanEnv(process.env, {
+    NODE_ENV: str(),
+    PORT: port(),
+  });
+};
+```
+
+`server.ts`
+```ts
+import { App } from '@/app';
+import { AuthRoute } from '@routes/auth.route';
+import { UserRoute } from '@routes/users.route';
+import { ValidateEnv } from '@utils/validateEnv';
+
+ValidateEnv();
+
+const app = new App([new UserRoute(), new AuthRoute()]);
+
+app.listen();
+```
+用于验证和清理环境变量。具体作用如下:
+1. 使用envalid的cleanEnv函数验证环境变量
+2. NODE_ENV环境变量必须是一个字符串
+3. PORT环境变量必须是一个有效的端口号
+4. 如果环境变量不存在或类型不正确,cleanEnv会抛出一个错误
+5. 这样可以确保获取到的环境变量为正确的类型和格式,避免由于环境变量导致的bug
+6. 通常在应用启动时就会验证环境变量,以此确保应用基于正确的环境配置运行
+
+
+所以,总体来说,这段代码用于在应用启动时验证和清理两個环境变量NODE_ENV和PORT,确保它们符合要求,为应用程序的后续运行提供保障,这在工程实践中是一个很好的习惯。
+
+
+### middleware - morgan
+
+```ts
+# logger.ts
+const stream = {
+  write: (message: string) => {
+    logger.info(message.substring(0, message.lastIndexOf('\n')));
+  },
+};
+
+
+# server.ts
+this.app.use(morgan(LOG_FORMAT, { stream }));
+```
+这行代码的作用是使用morgan中间件将HTTP请求日志写入我们定义的stream之中。
+morgan是一个HTTP请求日志记录中间件,可以将请求日志写入控制台、文件或其他stream。
+这里,我们使用了之前定义的stream对象,它的write方法将日志消息写入winston logger。
+所以,总体来说,这行代码实现了将HTTP请求日志通过morgan中间件记录到我们建立的winston日志系统之中。
+这样,HTTP请求日志可以和应用程序其他日志统一管理,更易于追踪调试和检查。
+LOG_FORMAT可能是一个字符串,定义morgan日志的格式。常见格式有:
+':method :url :status :res[content-length] - :response-time ms' 
+'[:date[clf]] :method :url :status :res[content-length] :response-time ms'
+它们会记录请求方法、URL、状态码、内容长度和响应时间等信息。
+所以,这段代码实际上加强了应用程序的可观察性,通过HTTP请求日志使应用行为更加透明,也为调试和优化应用提供了便利。对系统工程有一定的积极作用。
+代码的目的:
+1. 使用morgan中间件记录HTTP请求日志
+2. 将日志消息写入winston日志系统,与应用其他日志统一管理
+3. LOG_FORMAT定义日志的格式和内容
+4. 增强应用程序的可观察性和透明性
+5. 方便应用程序的调试和性能优化
+
+
